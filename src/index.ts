@@ -28,9 +28,134 @@ const bot = new Telegraf(BOT_TOKEN);
 const adminPriceEdit = new Map<number, string>();
 const remindedUsers = new Set<number>();
 
+// The first ID in config.ts's ADMIN_IDS is the permanent super admin.
+// Only this account can add or remove other admins — this is fixed at
+// startup and does NOT change even if it's later removed from the DB
+// admins table, so you can never accidentally lock yourself out.
+const SUPER_ADMIN_ID = Number(ADMIN_IDS[0]);
+
+// Restaurant name/address/bank info now live in the DB (see `settings`
+// table below) instead of being hardcoded in config.ts, so admins can
+// change them from inside Telegram. This in-memory copy is loaded at
+// startup and kept in sync whenever an admin edits a value.
+const runtimeSettings = {
+  name: RESTAURANT.name,
+  address: RESTAURANT.location,
+  bankAccount: RESTAURANT.bank.account,
+  bankAccountName: RESTAURANT.bank.accountName,
+};
+
+// Admin Telegram IDs now live in the DB `admins` table instead of the
+// static ADMIN_IDS array, so the super admin can add/remove admins from
+// inside Telegram without redeploying. Cached in memory for fast checks.
+const adminIdsCache = new Set<number>();
+
+// Tracks which field (name/address/bank account/bank name/new admin ID)
+// an admin is currently typing a new value for, via the /settings menu.
+type SettingsEditType = "name" | "address" | "bank_account" | "bank_name" | "add_admin";
+const adminEditState = new Map<number, { type: SettingsEditType }>();
+
 bot.catch((err, ctx) => {
   console.error(`Bot error for update type ${ctx.updateType}:`, err);
 });
+
+// ─────────────────────────────────────────────
+// SETTINGS & ADMINS (DB-BACKED)
+// ─────────────────────────────────────────────
+
+async function ensureSettingsTables(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admins (
+      telegram_id BIGINT PRIMARY KEY,
+      added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function getSetting(key: string): Promise<string | null> {
+  const result = await pool.query(`SELECT value FROM settings WHERE key = $1`, [key]);
+  return result.rows.length ? result.rows[0].value : null;
+}
+
+async function setSetting(key: string, value: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = $2`,
+    [key, value]
+  );
+}
+
+async function loadSettings(): Promise<void> {
+  runtimeSettings.name = (await getSetting("restaurant_name")) ?? RESTAURANT.name;
+  runtimeSettings.address = (await getSetting("restaurant_address")) ?? RESTAURANT.location;
+  runtimeSettings.bankAccount = (await getSetting("bank_account")) ?? RESTAURANT.bank.account;
+  runtimeSettings.bankAccountName =
+    (await getSetting("bank_account_name")) ?? RESTAURANT.bank.accountName;
+}
+
+async function loadAdmins(): Promise<void> {
+  const result = await pool.query(`SELECT telegram_id FROM admins`);
+  adminIdsCache.clear();
+  for (const row of result.rows) adminIdsCache.add(Number(row.telegram_id));
+
+  // First run: seed the DB from config.ts's ADMIN_IDS so existing admins
+  // keep working without any manual setup.
+  if (adminIdsCache.size === 0) {
+    for (const id of ADMIN_IDS) {
+      const numId = Number(id);
+      adminIdsCache.add(numId);
+      await pool.query(
+        `INSERT INTO admins (telegram_id) VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING`,
+        [numId]
+      );
+    }
+  }
+
+  // Super admin is always an admin, even if somehow removed from the DB.
+  adminIdsCache.add(SUPER_ADMIN_ID);
+}
+
+function isAdmin(userId: number) {
+  return adminIdsCache.has(Number(userId));
+}
+
+function isSuperAdmin(userId: number) {
+  return Number(userId) === SUPER_ADMIN_ID;
+}
+
+async function settingsKeyboard(userId: number) {
+  const rows: any[] = [
+    [Markup.button.callback("🏪 የሬስቶራንት ስም ቀይር", "settings_name")],
+    [Markup.button.callback("📍 አድራሻ ቀይር", "settings_address")],
+    [Markup.button.callback("🏦 የባንክ ሂሳብ ቁጥር ቀይር", "settings_bank_account")],
+    [Markup.button.callback("👤 የባንክ ሂሳብ ስም ቀይር", "settings_bank_name")],
+    [Markup.button.callback("📋 የአድሚን ዝርዝር", "settings_list_admins")],
+  ];
+  if (isSuperAdmin(userId)) {
+    rows.push([
+      Markup.button.callback("➕ አድሚን ጨምር", "settings_add_admin"),
+      Markup.button.callback("➖ አድሚን አስወግድ", "settings_remove_admin"),
+    ]);
+  }
+  rows.push([Markup.button.callback("✔️ ዝጋ", "settings_close")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function removeAdminKeyboard() {
+  const rows = [...adminIdsCache]
+    .filter((id) => id !== SUPER_ADMIN_ID)
+    .map((id) => [Markup.button.callback(`➖ ${id}`, `rm_admin_${id}`)]);
+  if (rows.length === 0) {
+    rows.push([Markup.button.callback("(ከዋና አድሚን በቀር ሌላ አድሚን የለም)", "noop")]);
+  }
+  return Markup.inlineKeyboard(rows);
+}
 
 // ─────────────────────────────────────────────
 // MARQUEE
@@ -133,7 +258,7 @@ async function toggleAvailability(itemId: string): Promise<boolean> {
 async function buildMenuText(userId: number): Promise<string> {
   const header = await buildHeader();
   const cart = getCart(userId);
-  let body = `🍽 እንኳን ደህና መጡ ወደ በምነት ሬስቶራንት!\n📍 ጎንደር፣ ማርኪ\n\nለማዘዝ ምግብ ይምረጡ:`;
+  let body = `🍽 እንኳን ወደ ${runtimeSettings.name} በሰላም መጡ!\n\n📍 ${runtimeSettings.address}\nለማዘዝ ምግብ ይምረጡ:`;
   if (cart.length > 0) {
     const lines = cart.map(
       (i) => `• ${i.name} x${i.quantity} — ${i.price * i.quantity} ብር`
@@ -204,14 +329,6 @@ async function manageMenuKeyboard() {
 }
 
 // ─────────────────────────────────────────────
-// ADMIN HELPERS
-// ─────────────────────────────────────────────
-
-function isAdmin(userId: number) {
-  return ADMIN_IDS.map(Number).includes(Number(userId));
-}
-
-// ─────────────────────────────────────────────
 // DAILY RESET (6:00 AM)
 // ─────────────────────────────────────────────
 
@@ -232,7 +349,7 @@ function scheduleDailyReset() {
            AND created_at < CURRENT_DATE`
       );
       remindedUsers.clear();
-      for (const adminId of ADMIN_IDS) {
+      for (const adminId of adminIdsCache) {
         try {
           await bot.telegram.sendMessage(
             adminId,
@@ -294,7 +411,7 @@ async function sendNightlyReport() {
   const today = new Date().toLocaleDateString("en-GB");
 
   if (orders.length === 0) {
-    for (const adminId of ADMIN_IDS) {
+    for (const adminId of adminIdsCache) {
       try {
         await bot.telegram.sendMessage(
           adminId,
@@ -346,9 +463,9 @@ async function sendNightlyReport() {
     rows.join(`\n${divider}\n`) +
     `\n${bottom}\n` +
     `\`\`\`\n\n` +
-    `🍽 *በምነት ሬስቶራንት — ጎንደር*`;
+    `🍽 *${runtimeSettings.name}*`;
 
-  for (const adminId of ADMIN_IDS) {
+  for (const adminId of adminIdsCache) {
     try {
       await bot.telegram.sendMessage(adminId, report, {
         parse_mode: "Markdown",
@@ -373,7 +490,7 @@ bot.start(async (ctx) => {
     const header = await buildHeader();
     return ctx.reply(
       header +
-        `እንኳን ደህና መጡ ወደ በምነት ሬስቶራንት! 🍽\nጎንደር፣ ማርኪ\n\nየምግብ ዝርዝሩ አሁን አይገኝም። እባክዎ ቆየት ብለው ይሞክሩ!`
+        `እንኳን ደህና መጡ ወደ ${runtimeSettings.name}! 🍽\n${runtimeSettings.address}\n\nየምግብ ዝርዝሩ አሁን አይገኝም። እባክዎ ቆየት ብለው ይሞክሩ!`
     );
   }
   ctx.reply(await buildMenuText(ctx.from.id), await menuKeyboard(ctx.from.id));
@@ -383,9 +500,30 @@ bot.command("menu", async (ctx) => {
   ctx.reply(await buildMenuText(ctx.from.id), await menuKeyboard(ctx.from.id));
 });
 
+// Lets anyone (admin or not) get their own Telegram numeric ID — handy
+// for the super admin to grab a person's ID before adding them via
+// /settings → ➕ አድሚን ጨምር.
+bot.command("id", (ctx) => {
+  ctx.reply(`🆔 የቴሌግራም ID: ${ctx.from.id}`);
+});
+
 bot.command("manage", async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
   ctx.reply("የምግብ ዝርዝር ያስተዳድሩ — ለመቀየር ይጫኑ:", await manageMenuKeyboard());
+});
+
+bot.command("settings", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  await ctx.reply(
+    `⚙️ ማዋቀሪያ\n\n` +
+      `የአሁኑ መረጃ፦\n` +
+      `🏪 ስም: ${runtimeSettings.name}\n` +
+      `📍 አድራሻ: ${runtimeSettings.address}\n` +
+      `🏦 ሂሳብ ቁጥር: ${runtimeSettings.bankAccount}\n` +
+      `👤 የሂሳብ ስም: ${runtimeSettings.bankAccountName}\n\n` +
+      `ለመቀየር ይምረጡ:`,
+    await settingsKeyboard(ctx.from.id)
+  );
 });
 
 bot.command("confirm", async (ctx) => {
@@ -398,7 +536,7 @@ bot.command("confirm", async (ctx) => {
   if (order) {
     await bot.telegram.sendMessage(
       order.customer_telegram_id,
-      `ትዕዛዝ #${orderId} ተረጋግጧል! በምነት ሬስቶራንት እያዘጋጀ ነው። 🍽`
+      `ትዕዛዝ #${orderId} ተረጋግጧል! ${runtimeSettings.name} እያዘጋጀ ነው። 🍽`
     );
   }
   ctx.reply(
@@ -430,7 +568,7 @@ bot.command("reply", async (ctx) => {
   try {
     await bot.telegram.sendMessage(
       order.customer_telegram_id,
-      `📨 *በምነት ሬስቶራንት:*\n\n${message}`,
+      `📨 *${runtimeSettings.name}:*\n\n${message}`,
       { parse_mode: "Markdown" }
     );
     ctx.reply(`✅ መልዕክት ለ ${order.customer_name} (ትዕዛዝ #${orderId}) ተልኳል።`);
@@ -485,7 +623,85 @@ bot.command("clearmarquee", async (ctx) => {
 });
 
 // ─────────────────────────────────────────────
-// ADMIN ACTIONS
+// SETTINGS ACTIONS
+// ─────────────────────────────────────────────
+
+bot.action("settings_name", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("አልተፈቀደም።");
+  adminEditState.set(ctx.from.id, { type: "name" });
+  await ctx.answerCbQuery();
+  await ctx.reply(`🏪 አዲሱን የሬስቶራንት ስም ይላኩ (የአሁኑ: ${runtimeSettings.name}):`);
+});
+
+bot.action("settings_address", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("አልተፈቀደም።");
+  adminEditState.set(ctx.from.id, { type: "address" });
+  await ctx.answerCbQuery();
+  await ctx.reply(`📍 አዲሱን አድራሻ ይላኩ (የአሁኑ: ${runtimeSettings.address}):`);
+});
+
+bot.action("settings_bank_account", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("አልተፈቀደም።");
+  adminEditState.set(ctx.from.id, { type: "bank_account" });
+  await ctx.answerCbQuery();
+  await ctx.reply(`🏦 አዲሱን የባንክ ሂሳብ ቁጥር ይላኩ (የአሁኑ: ${runtimeSettings.bankAccount}):`);
+});
+
+bot.action("settings_bank_name", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("አልተፈቀደም።");
+  adminEditState.set(ctx.from.id, { type: "bank_name" });
+  await ctx.answerCbQuery();
+  await ctx.reply(`👤 አዲሱን የባንክ ሂሳብ ስም ይላኩ (የአሁኑ: ${runtimeSettings.bankAccountName}):`);
+});
+
+bot.action("settings_list_admins", async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery("አልተፈቀደም።");
+  await ctx.answerCbQuery();
+  const lines = [...adminIdsCache].map((id) =>
+    id === SUPER_ADMIN_ID ? `👑 ${id} (ዋና አድሚን)` : `👤 ${id}`
+  );
+  await ctx.reply(`📋 የአድሚን ዝርዝር:\n\n${lines.join("\n")}`);
+});
+
+bot.action("settings_add_admin", async (ctx) => {
+  if (!isSuperAdmin(ctx.from.id)) return ctx.answerCbQuery("የዋና አድሚን ብቻ ስልጣን አለው።");
+  adminEditState.set(ctx.from.id, { type: "add_admin" });
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    "➕ አዲሱን አድሚን የቴሌግራም ID ይላኩ።\n\n" +
+      "ID ለማግኘት: አዲሱ ሰው ቦቱን ከፍቶ /id ብሎ ይላክልዎት።"
+  );
+});
+
+bot.action("settings_remove_admin", async (ctx) => {
+  if (!isSuperAdmin(ctx.from.id)) return ctx.answerCbQuery("የዋና አድሚን ብቻ ስልጣን አለው።");
+  await ctx.answerCbQuery();
+  await ctx.reply("➖ የትኛውን አድሚን ማስወገድ ይፈልጋሉ?", await removeAdminKeyboard());
+});
+
+bot.action(/^rm_admin_(\d+)$/, async (ctx) => {
+  if (!isSuperAdmin(ctx.from.id)) return ctx.answerCbQuery("የዋና አድሚን ብቻ ስልጣን አለው።");
+  const targetId = Number(ctx.match[1]);
+  if (targetId === SUPER_ADMIN_ID) {
+    return ctx.answerCbQuery("ዋና አድሚን ሊወገድ አይችልም።");
+  }
+  await pool.query(`DELETE FROM admins WHERE telegram_id = $1`, [targetId]);
+  adminIdsCache.delete(targetId);
+  await ctx.answerCbQuery("ተወግዷል ✅");
+  try {
+    await ctx.editMessageText(`✅ አድሚን ${targetId} ተወግዷል።`);
+  } catch {}
+});
+
+bot.action("settings_close", async (ctx) => {
+  await ctx.answerCbQuery("ተዘግቷል");
+  try {
+    await ctx.editMessageText("⚙️ ማዋቀሪያ ተዘግቷል።");
+  } catch {}
+});
+
+// ─────────────────────────────────────────────
+// ADMIN MENU ACTIONS
 // ─────────────────────────────────────────────
 
 bot.action(/^toggle_(.+)$/, async (ctx) => {
@@ -630,6 +846,69 @@ bot.action(/^order_type_(delivery|pickup)$/, async (ctx) => {
 bot.on("text", async (ctx) => {
   const userId = ctx.from.id;
 
+  // ── Settings edits (name/address/bank info/new admin ID) ──
+  if (isAdmin(userId) && adminEditState.has(userId)) {
+    const state = adminEditState.get(userId)!;
+    const raw = ctx.message.text.trim();
+
+    if (state.type === "add_admin") {
+      if (!isSuperAdmin(userId)) {
+        adminEditState.delete(userId);
+        return;
+      }
+      if (!/^\d+$/.test(raw)) {
+        return ctx.reply("የቴሌግራም ID ቁጥር ብቻ (ለምሳሌ 123456789) መሆን አለበት። እባክዎ እንደገና ይላኩ:");
+      }
+      const newAdminId = Number(raw);
+      await pool.query(
+        `INSERT INTO admins (telegram_id) VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING`,
+        [newAdminId]
+      );
+      adminIdsCache.add(newAdminId);
+      adminEditState.delete(userId);
+      await ctx.reply(`✅ አድሚን ${newAdminId} ታክሏል።`);
+      try {
+        await bot.telegram.sendMessage(
+          newAdminId,
+          `🎉 እንኳን ደስ አለዎት! የ${runtimeSettings.name} አድሚን ሆነዋል።\n\nየአድሚን ትዕዛዞችን ለማየት /manage ወይም /settings ይጫኑ።`
+        );
+      } catch {}
+      return;
+    }
+
+    if (!raw) {
+      return ctx.reply("ባዶ መሆን የለበትም። እባክዎ እንደገና ይላኩ:");
+    }
+
+    if (state.type === "name") {
+      await setSetting("restaurant_name", raw);
+      runtimeSettings.name = raw;
+      adminEditState.delete(userId);
+      return ctx.reply(`✅ የሬስቶራንት ስም ወደ "${raw}" ተቀይሯል።`);
+    }
+
+    if (state.type === "address") {
+      await setSetting("restaurant_address", raw);
+      runtimeSettings.address = raw;
+      adminEditState.delete(userId);
+      return ctx.reply(`✅ አድራሻ ወደ "${raw}" ተቀይሯል።`);
+    }
+
+    if (state.type === "bank_account") {
+      await setSetting("bank_account", raw);
+      runtimeSettings.bankAccount = raw;
+      adminEditState.delete(userId);
+      return ctx.reply(`✅ የባንክ ሂሳብ ቁጥር ወደ "${raw}" ተቀይሯል።`);
+    }
+
+    if (state.type === "bank_name") {
+      await setSetting("bank_account_name", raw);
+      runtimeSettings.bankAccountName = raw;
+      adminEditState.delete(userId);
+      return ctx.reply(`✅ የባንክ ሂሳብ ስም ወደ "${raw}" ተቀይሯል።`);
+    }
+  }
+
   if (isAdmin(userId) && adminPriceEdit.has(userId)) {
     const itemId = adminPriceEdit.get(userId)!;
     const raw = ctx.message.text.trim();
@@ -709,8 +988,8 @@ async function finalizeOrder(ctx: any, draft: ReturnType<typeof getDraft>) {
   await ctx.reply(
     `ትዕዛዝ #${orderId} ተቀብለናል! ✅\n\n${summary}\n\nድምር: ${total} ብር\n\n` +
       `እባክዎ ወደ ሂሳብ ቁጥሩ ያስተላልፉ:\n🏦 የኢትዮጵያ ንግድ ባንክ (CBE)\n` +
-      `ሂሳብ ቁጥር: ${RESTAURANT.bank.account}\n` +
-      `ስም: ${RESTAURANT.bank.accountName}\n\n` +
+      `ሂሳብ ቁጥር: ${runtimeSettings.bankAccount}\n` +
+      `ስም: ${runtimeSettings.bankAccountName}\n\n` +
       `ክፍያ ከፈጸሙ በኋላ የክፍያ ስክሪንሾት እዚህ ይላኩ።`
   );
 
@@ -738,7 +1017,7 @@ bot.on("photo", async (ctx) => {
   );
 
   await ctx.reply(
-    `እናመሰግናለን! የክፍያ ስክሪንሾትዎ ለትዕዛዝ #${orderId} ደርሷል። በምነት ሬስቶራንት በቅርቡ ያረጋግጥልዎታል። 🙏`
+    `እናመሰግናለን! የክፍያ ስክሪንሾትዎ ለትዕዛዝ #${orderId} ደርሷል። ${runtimeSettings.name} በቅርቡ ያረጋግጥልዎታል። 🙏`
   );
 
   const orderResult = await pool.query(`SELECT * FROM orders WHERE id = $1`, [orderId]);
@@ -752,7 +1031,7 @@ bot.on("photo", async (ctx) => {
   const orderTypeLine =
     order.order_type === "delivery"
       ? `🚗 ዴሊቨሪ አድራሻ: ${order.delivery_address}`
-      : `🏪 እራሱ ይወስዳል — ${RESTAURANT.location}`;
+      : `🏪 እራሱ ይወስዳል — ${runtimeSettings.address}`;
 
   const adminText =
     `🆕 አዲስ ትዕዛዝ #${order.id} — ክፍያ ተልኳል\n\n` +
@@ -760,7 +1039,7 @@ bot.on("photo", async (ctx) => {
     `${itemLines}\n\nድምር: ${order.total_amount} ብር\n\n` +
     `💬 ለደንበኛው ለመልስ: /reply ${order.id} <መልዕክት>`;
 
-  for (const adminId of ADMIN_IDS) {
+  for (const adminId of adminIdsCache) {
     try {
       await bot.telegram.sendPhoto(adminId, fileId, { caption: adminText });
     } catch (err) {
@@ -777,9 +1056,12 @@ bot.on("photo", async (ctx) => {
 // ─────────────────────────────────────────────
 
 initDb()
+  .then(ensureSettingsTables)
+  .then(loadAdmins)
+  .then(loadSettings)
   .then(() => bot.launch({ dropPendingUpdates: true }))
   .then(() => {
-    console.log(`${RESTAURANT.name} bot is running.`);
+    console.log(`${runtimeSettings.name} bot is running.`);
     scheduleDailyReset();
     scheduleNightlyReport();
   })
